@@ -75,65 +75,70 @@ class TerminateLaunchDependency extends StepBase {
             this.payloadOrConfig.string(inPayloadKeys.externalId),
             this.payloadOrConfig.string(inPayloadKeys.existingEnvironmentStatus),
         ]);
-        const [environmentScService] = await this.mustFindServices(['environmentScService']);
+        const [albService, environmentScService] = await this.mustFindServices(['albService', 'environmentScService']);
         const environment = await environmentScService.mustFind(requestContext, { id: envId });
         const projectId = environment.projectId;
-        // Setting project id to use while polling for status
-        this.state.setKey('PROJECT_ID', projectId);
-        // convert output array to object. Return {} if no outputs found
-        const environmentOutputs = await this.cfnOutputsArrayToObject(_.get(environment, 'outputs', []));
-        const connectionType = _.get(environmentOutputs, 'MetaConnection1Type', '');
-        // Clean up listener rule and Route53 record before deleting ALB and Workspace
-        if (connectionType.toLowerCase() === 'rstudiov2') {
-            const [albService, environmentDnsService] = await this.mustFindServices(['albService', 'environmentDnsService']);
-            const albExists = await albService.checkAlbExists(requestContext, projectId);
-            if (albExists) {
-                try {
-                    const deploymentItem = await albService.getAlbDetails(requestContext, projectId);
-                    const dnsName = JSON.parse(deploymentItem.value).albDnsName;
-                    await environmentDnsService.deleteRecord('rstudio', envId, dnsName);
-                } catch (error) {
-                    // Don't fail the termination if record deletion failed
-                    this.print({
-                        msg: `Record deletion failed with error - ${error.message}`,
-                    });
+        const awsAccountId = await albService.findAwsAccountId(requestContext, projectId);
+        //Locking the ALB termination to avoid race condiitons on parallel provisioning.
+        //expiresIn is set to 10 minutes. attemptsCount is set to 600 to retry after 1 seconds for 10 minutes
+        await lockService.tryWriteLockAndRun({ id: `alb-update-${awsAccountId}`, expiresIn: 600 }, async () => {
+            // Setting project id to use while polling for status
+            this.state.setKey('PROJECT_ID', projectId);
+            // convert output array to object. Return {} if no outputs found
+            const environmentOutputs = await this.cfnOutputsArrayToObject(_.get(environment, 'outputs', []));
+            const connectionType = _.get(environmentOutputs, 'MetaConnection1Type', '');
+            // Clean up listener rule and Route53 record before deleting ALB and Workspace
+            if (connectionType.toLowerCase() === 'rstudiov2') {
+                const [albService, environmentDnsService] = await this.mustFindServices(['albService', 'environmentDnsService']);
+                const albExists = await albService.checkAlbExists(requestContext, projectId);
+                if (albExists) {
+                    try {
+                        const deploymentItem = await albService.getAlbDetails(requestContext, projectId);
+                        const dnsName = JSON.parse(deploymentItem.value).albDnsName;
+                        await environmentDnsService.deleteRecord('rstudio', envId, dnsName);
+                    } catch (error) {
+                        // Don't fail the termination if record deletion failed
+                        this.print({
+                            msg: `Record deletion failed with error - ${error.message}`,
+                        });
+                    }
+                }
+                const ruleArn = _.get(environmentOutputs, 'ListenerRuleARN', null);
+                //Skipping rule deletion for the cases where the product provisioing failed before creating rule
+                //Termination should not be affected in such scenarios
+                if (ruleArn) {
+                    try {
+                        //creating resolvedvars object with the necessary Metadata
+                        const resolvedVars = {
+                            projectId: projectId,
+                            externalId: externalId
+                        };
+                        await albService.deleteListenerRule(requestContext, resolvedVars, ruleArn);
+                    } catch (error) {
+                        // Don't fail the termination if rule deletion failed
+                        this.print({
+                            msg: `Rule deletion failed with error - ${error.message}`,
+                        });
+                    }
                 }
             }
-            const ruleArn = _.get(environmentOutputs, 'ListenerRuleARN', null);
-            //Skipping rule deletion for the cases where the product provisioing failed before creating rule
-            //Termination should not be affected in such scenarios
-            if (ruleArn) {
-                try {
-                    //creating resolvedvars object with the necessary Metadata
-                    const resolvedVars = {
-                        projectId: projectId,
-                        externalId: externalId
-                    };
-                    await albService.deleteListenerRule(requestContext, resolvedVars, ruleArn);
-                } catch (error) {
-                    // Don't fail the termination if rule deletion failed
-                    this.print({
-                        msg: `Rule deletion failed with error - ${error.message}`,
-                    });
+            // Get Template outputs to check NeedsALB flag. Not reading template outputs from DB
+            // Because failed products will not have outputs stored
+            const templateOutputs = await this.getTemplateOutputs(requestContext, environment.envTypeId);
+            const needsAlb = _.get(templateOutputs.NeedsALB, 'Value', false);
+            if (needsAlb) {
+                //Dont decrease count for failed products
+                if (!_.includes(['FAILED', 'TERMINATING_FAILED'], existingEnvironmentStatus)) {
+                    const [albService] = await this.mustFindServices(['albService']);
+                    await albService.decreaseAlbDependentWorkspaceCount(requestContext, projectId);
                 }
+                return await this.checkAndTerminateAlb(requestContext, projectId, externalId);
+            } else {
+                this.print({
+                    msg: `Needs ALB Flag does not exists, skipping ALB termination`
+                });
             }
-        }
-        // Get Template outputs to check NeedsALB flag. Not reading template outputs from DB
-        // Because failed products will not have outputs stored
-        const templateOutputs = await this.getTemplateOutputs(requestContext, environment.envTypeId);
-        const needsAlb = _.get(templateOutputs.NeedsALB, 'Value', false);
-        if (needsAlb) {
-            //Dont decrease count for failed products
-            if (!_.includes(['FAILED', 'TERMINATING_FAILED'], existingEnvironmentStatus)) {
-                const [albService] = await this.mustFindServices(['albService']);
-                await albService.decreaseAlbDependentWorkspaceCount(requestContext, projectId);
-            }
-            return await this.checkAndTerminateAlb(requestContext, projectId, externalId);
-        } else {
-            this.print({
-                msg: `Needs ALB Flag does not exists, skipping ALB termination`
-            });
-        }
+        }, { attemptsCount: 600 });
     }
 
     /**

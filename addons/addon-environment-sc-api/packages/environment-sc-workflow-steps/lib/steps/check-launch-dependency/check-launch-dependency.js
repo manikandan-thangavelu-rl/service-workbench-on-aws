@@ -33,11 +33,9 @@ const inPayloadKeys = {
     productId: 'productId',
 };
 
-// const outPayloadKeys = {
-//     launchConstraintRole: 'launchConstraintRole',
-//     portfolioId: 'portfolioId',
-//     productId: 'productId',
-// };
+const outPayloadKeys = {
+    needsAlb: 'needsAlb',
+};
 
 const settingKeys = {
     envMgmtRoleArn: 'envMgmtRoleArn',
@@ -75,6 +73,12 @@ class CheckLaunchDependency extends StepBase {
         };
     }
 
+    outputKeys() {
+        return {
+            [outPayloadKeys.needsAlb]: 'boolean',
+        };
+    }
+
     async start() {
         const [requestContext, resolvedVars, productId, envTypeId, envTypeConfigId] = await Promise.all([
             this.payloadOrConfig.object(inPayloadKeys.requestContext),
@@ -83,19 +87,28 @@ class CheckLaunchDependency extends StepBase {
             this.payloadOrConfig.string(inPayloadKeys.envTypeId),
             this.payloadOrConfig.string(inPayloadKeys.envTypeConfigId),
         ]);
+        const [albService, lockService] = await this.mustFindServices(['albService', 'lockService']);
         const projectId = resolvedVars.projectId;
-        const [envTypeConfigService] = await this.mustFindServices(['envTypeConfigService']);
-        const envTypeConfig = await envTypeConfigService.mustFind(requestContext, envTypeId, { id: envTypeConfigId });
+        const awsAccountId = await albService.findAwsAccountId(requestContext, projectId);
+        //Locking the ALB provisioing to avoid race condiitons on parallel provisioning.
+        //expiresIn is set to 10 minutes. attemptsCount is set to 600 to retry after 1 seconds for 10 minutes
+        await lockService.tryWriteLockAndRun({ id: `alb-update-${awsAccountId}`, expiresIn: 600 }, async () => {
+            const [envTypeConfigService] = await this.mustFindServices(['envTypeConfigService']);
+            const envTypeConfig = await envTypeConfigService.mustFind(requestContext, envTypeId, { id: envTypeConfigId });
 
-        // Create dynamic namespace follows the existing pattern of namespace
-        resolvedVars.namespace = `analysis-${Date.now()}`;
-        const resolvedInputParams = await this.resolveVarExpressions(envTypeConfig.params, resolvedVars);
-        const templateOutputs = await this.getTemplateOutputs(requestContext, envTypeId);
-        const needsAlb = _.get(templateOutputs.NeedsALB, 'Value', false);
-        const maxAlbWorkspacesCount = _.get(templateOutputs.MaxCountALBDependentWorkspaces, 'Value', MAX_COUNT_ALB_DEPENDENT_WORKSPACES);
-        if (needsAlb) {
-            return await this.provisionAlb(requestContext, resolvedVars, projectId, resolvedInputParams, maxAlbWorkspacesCount);
-        }
+            // Create dynamic namespace follows the existing pattern of namespace
+            resolvedVars.namespace = `analysis-${Date.now()}`;
+            const resolvedInputParams = await this.resolveVarExpressions(envTypeConfig.params, resolvedVars);
+            const templateOutputs = await this.getTemplateOutputs(requestContext, envTypeId);
+            const needsAlb = _.get(templateOutputs.NeedsALB, 'Value', false);
+            const maxAlbWorkspacesCount = _.get(templateOutputs.MaxCountALBDependentWorkspaces, 'Value', MAX_COUNT_ALB_DEPENDENT_WORKSPACES);
+            if (needsAlb) {
+                //Sets needs alb to payload so it can be used to decrease alb workspace count on product failure
+                await this.payload.setKey(outPayloadKeys.needsAlb, needsAlb);
+                await this.provisionAlb(requestContext, resolvedVars, projectId, resolvedInputParams, maxAlbWorkspacesCount);
+                await albService.increaseAlbDependentWorkspaceCount(requestContext, projectId);
+            }
+        }, { attemptsCount: 600 });
     }
 
     /**
